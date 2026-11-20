@@ -1,8 +1,11 @@
 # -*- coding:utf-8 -*-
 import os, sys, time
+import json
+import re
 import random
+import hashlib
 import bpy
-from bpy.props import StringProperty, BoolProperty, EnumProperty, IntProperty
+from bpy.props import StringProperty, BoolProperty, EnumProperty, FloatProperty, IntProperty
 from bpy.types import Operator
 import bmesh
 import math
@@ -16,28 +19,45 @@ from ..core.lib.shapefile import Reader as shpReader
 from ..geoscene import GeoScene, georefManagerLayout
 from ..prefs import PredefCRS
 from ..core import BBOX
+from ..core import bonsai_pset_display
 from ..core.proj import Reproj
+from ..core.proj.shapefile_crs import CRSInspectionError, inspect_shapefile_set, transform_coordinates
+from ..core.ifc_georeference import (GeoreferenceError, create_map_conversion, existing_map_origin,
+	set_direct_site_placement, validate_new_direct_placement, validate_new_map_conversion)
 from ..core.utils import perf_clock
 
 from .utils import adjust3Dview, getBBOX, DropToGround
 
-# Try to import Bonsai and ifcopenshell for IFC integration
-IFCOPENSHELL_AVAILABLE = False
-try:
-	import ifcopenshell
-	IFCOPENSHELL_AVAILABLE = True
-	log.info("IfcOpenShell detected - IFC Pset creation available")
-except ImportError:
-	log.info("IfcOpenShell not detected - IFC Pset creation unavailable")
+def _get_bonsai_tool():
+	"""Use Bonsai only after it has been initialized by Blender.
 
-# Try to import Bonsai for IFC integration
-BONSAI_AVAILABLE = False
-try:
-	import bonsai.tool as tool
-	BONSAI_AVAILABLE = True
-	log.info("Bonsai detected - IFC integration available")
-except ImportError:
-	log.info("Bonsai not detected - IFC integration will use custom properties only")
+	Importing bonsai.tool directly before Bonsai starts can cause a circular
+	import. Checking at use time also supports enabling Bonsai after this add-on.
+	"""
+	tool = sys.modules.get("bonsai.tool")
+	return tool if tool is not None and hasattr(tool, "Ifc") else None
+
+
+def _prepare_ifc_geometry(context, model):
+	"""Check Bonsai's kernel before it can partially modify the IFC model."""
+	props = getattr(context.scene, "BIMProjectProperties", None)
+	if props is None or not hasattr(props, "geometry_library"):
+		return False
+	import ifcopenshell.geom
+	def check(library):
+		return ifcopenshell.geom.iterator(
+			ifcopenshell.geom.settings(), model, 1, geometry_library=library)
+	library = props.geometry_library
+	try:
+		check(library)
+		return False
+	except RuntimeError as exc:
+		if library == 'opencascade' or 'Invalid hybrid kernel' not in str(exc):
+			raise
+		log.warning("Bonsai's %s kernel is unavailable; checking OpenCASCADE", library)
+		check('opencascade')
+		props.geometry_library = 'opencascade'
+		return True
 
 
 def _prepare_pset_properties(properties):
@@ -46,37 +66,35 @@ def _prepare_pset_properties(properties):
 	for key, value in properties.items():
 		if isinstance(value, bytes):
 			value = value.decode('utf-8', errors='replace').strip()
-		elif value is None:
-			value = ""
-		elif isinstance(value, (int, float)):
-			value = value
-		else:
+		elif value is not None and not isinstance(value, (str, int, float)):
 			value = str(value)
 		pset_props[key] = value
 	return pset_props
 
 
-def _create_pset_for_element(model, element, properties):
-	"""Create a Pset_GIS_Attributes on the given IFC element."""
-	if not properties or not IFCOPENSHELL_AVAILABLE:
+def _create_pset_for_element(model, element, properties, pset_name="Pset_GIS_Attributes"):
+	"""Create a property set containing shapefile attributes on the IFC element."""
+	if not properties:
 		return
+	from ifcopenshell.api.pset import add_pset, edit_pset
+
+	pset_name = pset_name.strip() or "Pset_GIS_Attributes"
 	try:
 		pset_props = _prepare_pset_properties(properties)
-		if not pset_props:
-			return
-		pset = ifcopenshell.api.pset.add_pset(model, product=element, name="Pset_GIS_Attributes")
-		ifcopenshell.api.pset.edit_pset(model, pset=pset, properties=pset_props)
-		log.info(f"Created Pset 'Pset_GIS_Attributes' with {len(pset_props)} properties on element {element.id()}")
+		pset = add_pset(model, product=element, name=pset_name)
+		edit_pset(model, pset=pset, properties=pset_props, should_purge=False)
+		log.info(f"Created Pset '{pset_name}' with {len(pset_props)} properties on element {element.id()}")
 	except Exception as e:
 		log.error(f"Failed to create IFC Pset for element {element.id()}: {e}", exc_info=True)
+		raise
 
 
-def _generate_random_color():
+def _generate_random_color(rng):
 	"""Generate a random color with good visibility."""
-	# Use golden ratio to generate visually distinct colors
-	hue = random.random()
-	saturation = 0.6 + random.random() * 0.4  # 0.6-1.0 for vibrant colors
-	value = 0.7 + random.random() * 0.3  # 0.7-1.0 for bright colors
+	# Use saturated, bright colors for visibility.
+	hue = rng.random()
+	saturation = 0.6 + rng.random() * 0.4  # 0.6-1.0 for vibrant colors
+	value = 0.7 + rng.random() * 0.3  # 0.7-1.0 for bright colors
 
 	# Convert HSV to RGB
 	import colorsys
@@ -89,82 +107,50 @@ def _get_color_for_field_value(value, color_map):
 	if value in color_map:
 		return color_map[value]
 	else:
-		color = _generate_random_color()
+		seed = int.from_bytes(hashlib.sha256(value.encode("utf-8")).digest(), "big")
+		color = _generate_random_color(random.Random(seed))
 		color_map[value] = color
 		return color
 
 
-def _assign_ifc_surface_style(model, element, color):
-	"""Assign an IfcSurfaceStyle with the given color to an IFC element."""
-	if not IFCOPENSHELL_AVAILABLE:
-		return False
-	try:
-		# Create a material
-		material = ifcopenshell.api.material.add_material(model, name=f"Style_{color[0]:.2f}_{color[1]:.2f}_{color[2]:.2f}")
+def _assign_ifc_surface_style(model, element, material, tool):
+	"""Link a Bonsai style to the material and the element's body geometry."""
+	import bonsai.core.style
+	import ifcopenshell.api.style
 
-		# Create a surface style
-		style = ifcopenshell.api.style.add_style(model, name="SurfaceStyle")
-
-		# Set the surface style rendering properties
-		ifcopenshell.api.style.add_surface_style(
-			model,
-			style=style,
-			ifc_class="IfcSurfaceStyleRendering",
-			properties={
-				"SurfaceColour": {
-					"Name": None,
-					"Red": color[0],
-					"Green": color[1],
-					"Blue": color[2]
-				},
-				"ReflectanceMethod": "FLAT",
-				"Transparency": 1.0 - color[3]  # Alpha to transparency
-			}
-		)
-
-		# Assign the style to the material
-		ifcopenshell.api.material.assign_style(model, material=material, style=style)
-
-		# Assign the material to the element
-		ifcopenshell.api.material.assign_material(model, product=element, material=material)
-
-		log.info(f"Assigned IfcSurfaceStyle to element {element.id()} with color RGB({color[0]:.2f}, {color[1]:.2f}, {color[2]:.2f})")
-		return True
-	except Exception as e:
-		log.error(f"Failed to assign IfcSurfaceStyle to element {element.id()}: {e}", exc_info=True)
-		return False
+	style = tool.Ifc.get_entity(material)
+	if style is None:
+		style = bonsai.core.style.add_style(tool.Ifc, tool.Style, material)
+	representation = getattr(element, "Representation", None)
+	bodies = [rep for rep in (representation.Representations if representation else ())
+		if rep.RepresentationIdentifier == "Body"]
+	if not bodies:
+		raise RuntimeError("IFC element has no Body representation")
+	for body in bodies:
+		ifcopenshell.api.style.assign_representation_styles(model, shape_representation=body, styles=[style])
 
 
-def assign_blender_material(obj, color):
-	"""Assign a Blender material with the given color to an object."""
-	try:
-		# Create or get material
-		mat_name = f"Color_{color[0]:.2f}_{color[1]:.2f}_{color[2]:.2f}"
-		if mat_name in bpy.data.materials:
-			mat = bpy.data.materials[mat_name]
-		else:
-			mat = bpy.data.materials.new(name=mat_name)
-			mat.use_nodes = True
-			bsdf = mat.node_tree.nodes["Principled BSDF"]
-			bsdf.inputs["Base Color"].default_value = color
-			bsdf.inputs["Alpha"].default_value = color[3]
-
-		# Assign material to object
-		if obj.data.materials:
-			obj.data.materials[0] = mat
-		else:
-			obj.data.materials.append(mat)
-
-		log.info(f"Assigned Blender material '{mat_name}' to object '{obj.name}'")
-	except Exception as e:
-		log.error(f"Failed to assign Blender material to object {obj.name}: {e}", exc_info=True)
+def assign_blender_material(obj, color, field, value):
+	"""Create a material for a field value and return it for IFC styling."""
+	mat = bpy.data.materials.new(name=f"{field}: {value}")
+	mat.diffuse_color = color
+	mat.use_nodes = True
+	bsdf = mat.node_tree.nodes.get("Principled BSDF")
+	bsdf.inputs["Base Color"].default_value = color
+	bsdf.inputs["Alpha"].default_value = color[3]
+	if obj.data.materials:
+		obj.data.materials[0] = mat
+	else:
+		obj.data.materials.append(mat)
+	return mat
 
 
-def assign_ifc_class_to_object(obj, ifc_class, predefined_type="", user_defined_type="", properties=None):
+def assign_ifc_class_to_object(obj, ifc_class, predefined_type="", user_defined_type="", properties=None, sync_placement=False, pset_name="Pset_GIS_Attributes"):
 	"""Assign IFC class to a Blender object using Bonsai API if available, otherwise use custom properties.
 	If properties dict is provided and Bonsai is active, creates an IFC Pset with the shapefile field values."""
 	properties = properties or {}
-	if BONSAI_AVAILABLE:
+	tool = _get_bonsai_tool()
+	if tool is not None:
 		# Save object name before any operations (Bonsai may rename the object)
 		obj_name = obj.name
 		try:
@@ -177,14 +163,15 @@ def assign_ifc_class_to_object(obj, ifc_class, predefined_type="", user_defined_
 					obj["IfcPredefinedType"] = predefined_type
 				if user_defined_type:
 					obj["IfcUserDefinedType"] = user_defined_type
-				for key, value in properties.items():
-					obj[key] = value
-				return
+				return True
 
 			# Record existing IFC elements before assignment so we can identify
 			# the newly created element afterwards
 			existing_elements = set(model)
 
+			# Evaluate the new object's placement before Bonsai reads its world matrix.
+			bpy.context.view_layer.update()
+			placement = obj.matrix_world.copy() if sync_placement else None
 			# Use Bonsai's built-in assign_class operator to properly handle
 			# object naming, navigation panel updates, and IFC geometry representation
 			bpy.ops.bim.assign_class(
@@ -212,11 +199,23 @@ def assign_ifc_class_to_object(obj, ifc_class, predefined_type="", user_defined_
 							break
 
 			if new_element is not None:
-				_create_pset_for_element(model, new_element, properties)
+				if sync_placement:
+					linked_obj = tool.Ifc.get_object(new_element)
+					if linked_obj is None or not getattr(new_element, 'Representation', None):
+						raise RuntimeError('Bonsai did not create IFC geometry for ' + obj_name)
+					# Bonsai's tessellation assignment can leave the IFC placement at the origin.
+					linked_obj.matrix_world = placement
+					bpy.context.view_layer.update()
+					if 'FINISHED' not in bpy.ops.bim.edit_object_placement(obj=linked_obj.name):
+						raise RuntimeError('Bonsai did not write IFC placement for ' + obj_name)
+				_create_pset_for_element(model, new_element, properties, pset_name)
 			else:
+				if sync_placement:
+					raise RuntimeError('Bonsai did not create an IFC element for ' + obj_name)
 				log.warning(f"Could not identify new IFC element for '{obj_name}' to create Pset")
 
 			log.info(f"Assigned IFC class '{ifc_class}' to object '{obj_name}' using Bonsai API")
+			return True
 		except Exception as e:
 			log.error(f"Failed to assign IFC class using Bonsai API: {e}", exc_info=True)
 			# Try to find the object by original name in case it was renamed
@@ -228,10 +227,9 @@ def assign_ifc_class_to_object(obj, ifc_class, predefined_type="", user_defined_
 						obj["IfcPredefinedType"] = predefined_type
 					if user_defined_type:
 						obj["IfcUserDefinedType"] = user_defined_type
-					for key, value in properties.items():
-						obj[key] = value
 			except Exception as fallback_e:
 				log.error(f"Could not set fallback IFC properties: {fallback_e}")
+			return False
 	else:
 		# Bonsai not available, use custom properties
 		obj["IfcClass"] = ifc_class
@@ -239,14 +237,261 @@ def assign_ifc_class_to_object(obj, ifc_class, predefined_type="", user_defined_
 			obj["IfcPredefinedType"] = predefined_type
 		if user_defined_type:
 			obj["IfcUserDefinedType"] = user_defined_type
-		for key, value in properties.items():
-			obj[key] = value
 		log.info(f"Assigned IFC class '{ifc_class}' to object '{obj.name}' using custom properties")
+		return True
 
 PKG, SUBPKG = __package__.split('.', maxsplit=1)
 
 # Temporary storage for batch import file paths
 _batch_files = []
+
+
+def _crs_preview(filepaths, inspection=None):
+	groups, errors = inspection if inspection is not None else inspect_shapefile_set(filepaths)
+	lines = []
+	for group in groups:
+		name = group['crs'].get('name', 'Unknown CRS')
+		candidates = group['candidates']
+		match = (' / '.join('%s (%d%%)' % item for item in candidates[:2])
+			if candidates else 'no EPSG match')
+		lines.append('%s: %s' % (name, match))
+		lines.append('%d file(s)' % len(group['files']))
+	for path, error in errors:
+		log.warning('Cannot inspect CRS for %s: %s', path, error)
+	if errors:
+		lines.append('%d file(s): CRS unavailable; see logs' % len(errors))
+	return json.dumps(lines)
+
+
+def _draw_crs_preview(layout, preview):
+	if not preview:
+		return
+	box = layout.box()
+	box.label(text='Source CRS information (review before import):')
+	for line in json.loads(preview):
+		box.label(text=line)
+
+
+_DIRECT_PLACEMENT_KEY = 'bgis_direct_site_placement'
+_PLACEMENT_MODES = (
+	('MAP', 'IFC map conversion', 'Store the CRS and projected offset in the IFC map conversion'),
+	('DIRECT', 'Direct Site placement', 'Write projected coordinates into Site placement for viewers that display local IFC coordinates'),
+)
+
+
+def _direct_project_state(scene, model):
+	state = json.loads(scene.get(_DIRECT_PLACEMENT_KEY, '[]'))
+	projects = model.by_type('IfcProject')
+	return state if state and len(projects) == 1 and state[0] == projects[0].GlobalId else None
+
+
+def _init_crs_dialog(operator, files, scene):
+	groups, errors = inspect_shapefile_set(files)
+	operator.suggestedCRS = ''
+	operator.projectCRS = ''
+	operator.crsPreview = _crs_preview(files, (groups, errors))
+	operator.crsMatches = json.dumps([group['candidates'][0] for group in groups
+		if group['candidates']])
+	tool = _get_bonsai_tool()
+	model = tool.Ifc.get() if tool else None
+	if model is not None and model.schema.upper() == 'IFC4':
+		state = _direct_project_state(scene, model)
+		if state:
+			operator.placementMode = 'DIRECT'
+			operator.projectCRS = state[1]
+			operator.targetCRS = state[1]
+			return
+		operations = model.by_type('IfcCoordinateOperation')
+		if len(operations) == 1:
+			operator.placementMode = 'MAP'
+			operator.projectCRS = operations[0].TargetCRS.Name or ''
+			operator.targetCRS = operator.projectCRS
+			return
+	if groups and not errors and all(len(group['candidates']) == 1
+		and group['crs']['type'] in ('ProjectedCRS', 'CompoundCRS') for group in groups):
+		candidates = {group['candidates'][0][0] for group in groups}
+		if len(candidates) == 1:
+			operator.suggestedCRS = candidates.pop()
+			operator.targetCRS = operator.suggestedCRS
+
+
+def _draw_ifc_crs(operator):
+	box = operator.layout.box()
+	if operator.projectCRS:
+		label = 'Direct Site placement' if operator.placementMode == 'DIRECT' else 'IFC map conversion'
+		box.label(text='Project placement: ' + label)
+	else:
+		box.prop(operator, 'placementMode')
+	if operator.placementMode == 'DIRECT':
+		box.label(text='Writes Site coordinates without an IFC map conversion.', icon='INFO')
+	matches = json.loads(operator.crsMatches or '[]')
+	uncertain = any(confidence < 100 for _, confidence in matches)
+	if operator.projectCRS:
+		box.label(text='Existing IFC CRS: ' + operator.projectCRS)
+	elif operator.suggestedCRS:
+		label = 'Suggested IFC target: ' if uncertain else 'Detected IFC target: '
+		box.label(text=label + operator.suggestedCRS)
+		box.prop(operator, 'overrideTarget')
+		if operator.overrideTarget:
+			box.prop(operator, 'targetCRS')
+	else:
+		box.label(text='Choose a projected CRS for this IFC project.')
+		box.prop(operator, 'targetCRS')
+	target = _selected_ifc_crs(operator)
+	reproject = bool(target) and any(source != target for source, _ in matches)
+	if uncertain:
+		box.label(text='Check the suggested source CRS in QGIS before confirming.', icon='INFO')
+	if reproject:
+		box.label(text='Layers will be converted to the IFC target CRS.', icon='INFO')
+	if uncertain and reproject:
+		box.prop(operator, 'confirmCRS', text='Confirm source CRS and coordinate conversion')
+	elif uncertain:
+		box.prop(operator, 'confirmCRS')
+	elif reproject:
+		box.prop(operator, 'confirmCRS', text='Confirm coordinate conversion')
+
+
+def _selected_ifc_crs(operator):
+	if operator.projectCRS:
+		return operator.projectCRS.strip().upper()
+	if operator.suggestedCRS and not operator.overrideTarget:
+		return operator.suggestedCRS
+	return operator.targetCRS.strip().upper()
+
+
+def _ifc_crs_plan(operator, files, scene):
+	from ifcopenshell.util.unit import calculate_unit_scale
+	target = _selected_ifc_crs(operator)
+	if not re.fullmatch(r'EPSG:[0-9]+', target):
+		raise CRSInspectionError('Enter a projected target EPSG code, for example EPSG:25832')
+	tool = _get_bonsai_tool()
+	model = tool.Ifc.get() if tool else None
+	if model is None:
+		raise GeoreferenceError('Open or create an IFC4 project in Bonsai first')
+	scale = calculate_unit_scale(model)
+	_ifc_project_origin(scene, tool, model, target, scale, operator.placementMode)
+	groups, errors = inspect_shapefile_set(files)
+	if errors or not groups:
+		raise CRSInspectionError(errors[0][1] if errors else 'No shapefile CRS was found')
+	sources = {}
+	for group in groups:
+		matches = group['candidates']
+		if not matches or (len(matches) > 1 and matches[0][1] <= matches[1][1]):
+			raise CRSInspectionError('Ambiguous source CRS. In QGIS, verify and re-export: ' + os.path.basename(group['files'][0]))
+		source, confidence = matches[0]
+		if (confidence < 100 or source != target) and not operator.confirmCRS:
+			reason = ('Verify the suggested source CRS in QGIS' if confidence < 100
+				else 'Confirm conversion to the IFC target CRS')
+			raise CRSInspectionError(reason + ' before importing ' + os.path.basename(group['files'][0]))
+		operation = transform_coordinates(source, target)
+		log.info('%s to %s: %s (accuracy %s m)', source, target, operation['description'], operation['accuracy_metres'])
+		for path in group['files']:
+			with shpReader(path) as shp:
+				if shp.shapeType not in (1, 3, 5):
+					raise CRSInspectionError('Georeferenced import currently supports 2D points, lines and polygons: ' + os.path.basename(path))
+			sources[path] = source
+	return target, sources
+
+
+class IMPORTGIS_OT_ifc_map_conversion(Operator):
+	bl_idname = 'importgis.ifc_map_conversion'
+	bl_label = 'Set IFC Project Placement'
+	bl_options = {'INTERNAL', 'UNDO'}
+	parameters: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+	placementMode: EnumProperty(items=_PLACEMENT_MODES, default='MAP', options={'HIDDEN', 'SKIP_SAVE'})
+	transaction_key = ''
+
+	def execute(self, context):
+		from bonsai.bim.ifc import IfcStore
+		return IfcStore.execute_ifc_operator(self, context)
+
+	def _execute(self, context):
+		tool = _get_bonsai_tool()
+		model = tool.Ifc.get()
+		parameters = json.loads(self.parameters)
+		if self.placementMode == 'MAP':
+			create_map_conversion(model, *parameters)
+		else:
+			eastings, northings, target, scale = parameters
+			set_direct_site_placement(model, *parameters)
+			props = tool.Georeference.get_georeference_props()
+			# Keep the Blender scene close to zero while Bonsai writes projected placements.
+			props.blender_offset_x = str(eastings / scale)
+			props.blender_offset_y = str(northings / scale)
+			props.blender_offset_z = '0'
+			props.blender_x_axis_abscissa = '1'
+			props.blender_x_axis_ordinate = '0'
+			props.has_blender_offset = True
+			context.scene[_DIRECT_PLACEMENT_KEY] = json.dumps([
+				model.by_type('IfcProject')[0].GlobalId, target, eastings, northings])
+			for element in model.by_type('IfcSpatialStructureElement'):
+				obj = tool.Ifc.get_object(element)
+				if obj is not None:
+					tool.Geometry.get_blender_offset_type(obj)
+		return {'FINISHED'}
+
+
+def _ifc_project_origin(scene, tool, model, target, scale, mode):
+	if model.schema.upper() != 'IFC4':
+		raise GeoreferenceError('Shapefile georeferencing requires an IFC4 project')
+	props = tool.Georeference.get_georeference_props()
+	state = _direct_project_state(scene, model)
+	if state:
+		if mode != 'DIRECT' or target != state[1]:
+			raise GeoreferenceError('This IFC already uses Direct Site placement. Use a fresh project to change placement mode or CRS')
+		from ifcopenshell.util.placement import get_local_placement
+		sites = model.by_type('IfcSite')
+		if (not props.has_blender_offset or model.by_type('IfcCoordinateOperation') or len(sites) != 1
+			or not sites[0].ObjectPlacement or not sites[0].ObjectPlacement.is_a('IfcLocalPlacement')):
+			raise GeoreferenceError('The IFC direct placement or its Blender offset has changed')
+		placement = get_local_placement(sites[0].ObjectPlacement)
+		origin = state[2], state[3]
+		if (any(abs(actual * scale - expected) > 1e-6
+				for actual, expected in zip(placement[:3, 3], (*origin, 0)))
+			or any(abs(float(actual) * scale - expected) > 1e-6 for actual, expected in zip(
+				(props.blender_offset_x, props.blender_offset_y, props.blender_offset_z), (*origin, 0)))
+			or float(props.blender_x_axis_abscissa) != 1 or float(props.blender_x_axis_ordinate) != 0):
+			raise GeoreferenceError('The IFC Site or Blender offset no longer matches the original direct placement')
+		return origin
+	if props.has_blender_offset:
+		raise GeoreferenceError('This IFC has an existing Bonsai Blender offset. Start with a fresh IFC4 project')
+	if mode == 'DIRECT':
+		validate_new_direct_placement(model, 0, 0, target, scale)
+		return None
+	origin = existing_map_origin(model, target, scale)
+	if origin is None:
+		validate_new_map_conversion(model, 0, 0, target, scale)
+	return origin
+
+
+def _establish_ifc_origin(geoscn, target, bbox, mode):
+	from ifcopenshell.util.unit import calculate_unit_scale
+	tool = _get_bonsai_tool()
+	model = tool.Ifc.get() if tool else None
+	if model is None:
+		raise GeoreferenceError('Open an IFC4 project in Bonsai first')
+	if geoscn.scale != 1:
+		raise GeoreferenceError('Use a scene without BlenderGIS map scaling')
+	scale = calculate_unit_scale(model)
+	origin = _ifc_project_origin(geoscn.scn, tool, model, target, scale, mode)
+	if geoscn.hasOriginPrj:
+		if geoscn.crs != target:
+			raise GeoreferenceError('Scene already uses another CRS. Start in a fresh IFC4 scene')
+		scene_origin = geoscn.getOriginPrj()
+		if origin and any(abs(a - b) > 1e-6 for a, b in zip(origin, scene_origin)):
+			raise GeoreferenceError('The scene origin differs from the IFC origin. Use a fresh scene')
+	else:
+		scene_origin = bbox.center
+	if origin is None:
+		origin = scene_origin
+		result = bpy.ops.importgis.ifc_map_conversion(parameters=json.dumps([*origin, target, scale]), placementMode=mode)
+		if 'FINISHED' not in result:
+			raise GeoreferenceError('Could not set the IFC project placement')
+	if geoscn.crs != target:
+		geoscn.crs = target
+	if not geoscn.hasOriginPrj:
+		geoscn.setOriginPrj(*origin, synch=False)
+	return origin
 
 featureType={
 0:'Null',
@@ -325,6 +570,15 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 	bl_options = {"INTERNAL"}
 
 	filepath: StringProperty()
+	crsPreview: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+	crsMatches: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+	projectCRS: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+	suggestedCRS: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+	georefIFC: BoolProperty(default=True, options={'HIDDEN'})
+	placementMode: EnumProperty(name='IFC placement', items=_PLACEMENT_MODES, default='MAP', options={'SKIP_SAVE'})
+	overrideTarget: BoolProperty(name='Choose a different target CRS', options={'SKIP_SAVE'})
+	targetCRS: StringProperty(name='IFC target CRS', options={'SKIP_SAVE'})
+	confirmCRS: BoolProperty(name='I verified the source CRS in QGIS', options={'SKIP_SAVE'})
 
 	#special function to auto redraw an operator popup called through invoke_props_dialog
 	def check(self, context):
@@ -373,9 +627,12 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 			('NONE', 'None', "Flat geometry"),
 			('GEOM', 'Geometry', "Use z value from shape geometry if exists"),
 			('FIELD', 'Field', "Extract z elevation value from an attribute field"),
-			('OBJ', 'Object', "Get z elevation value from an existing ground mesh")
+			('OBJ', 'Object', "Get z elevation value from an existing ground mesh"),
+			('MANUAL', 'Manual', "Enter one base elevation for all imported features"),
 			],
 			default='GEOM')
+	manualElevation: FloatProperty(name='Base elevation', unit='LENGTH',
+		description='Set the same base Z for all imported features, before any extrusion')
 
 	# Elevation object
 	objElevLst: EnumProperty(
@@ -431,9 +688,9 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 
 	# IFC Assignment
 	assignIFC: BoolProperty(
-			name="Assign IFC Class",
+			name="Create IFC elements",
 			description="Assign IFC class to imported objects for Bonsai/BlenderBIM",
-			default=False )
+			default=True )
 	
 	ifcClass: StringProperty(
 			name="IFC Class",
@@ -449,6 +706,11 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 			name="IFC User Defined Type",
 			description="IFC user defined type (optional)",
 			default="" )
+
+	psetName: StringProperty(
+			name="Property set name",
+			description="IFC property set for shapefile attributes (blank uses the default)",
+			default="Pset_GIS_Attributes" )
 
 	# Random coloring
 	useRandomColor: BoolProperty(
@@ -475,6 +737,8 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 			layout.prop(self, 'fieldElevName')
 		elif self.vertsElevSource == 'OBJ':
 			layout.prop(self, 'objElevLst')
+		elif self.vertsElevSource == 'MANUAL':
+			layout.prop(self, 'manualElevation')
 		#
 		layout.prop(self, 'useFieldExtrude')
 		if self.useFieldExtrude:
@@ -495,21 +759,28 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 			layout.prop(self, 'ifcClass')
 			layout.prop(self, 'ifcPredefinedType')
 			layout.prop(self, 'ifcUserDefinedType')
+			if self.separateObjects:
+				layout.prop(self, 'psetName')
 		#
-		layout.prop(self, 'useRandomColor')
-		if self.useRandomColor:
-			layout.prop(self, 'fieldColorName')
+		if self.separateObjects:
+			layout.prop(self, 'useRandomColor')
+			if self.useRandomColor:
+				layout.prop(self, 'fieldColorName')
 		#
 		geoscn = GeoScene()
+		_draw_crs_preview(layout, self.crsPreview)
+		_draw_ifc_crs(self)
+		if self.assignIFC and self.georefIFC:
+			return
 		#geoscnPrefs = context.preferences.addons['geoscene'].preferences
 		if geoscn.isPartiallyGeoref:
 			layout.prop(self, 'reprojection')
 			if self.reprojection:
 				self.shpCRSInputLayout(context)
 			#
-			georefManagerLayout(self, context)
 		else:
 			self.shpCRSInputLayout(context)
+		georefManagerLayout(self, context)
 
 
 	def shpCRSInputLayout(self, context):
@@ -523,7 +794,8 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 
 
 	def invoke(self, context, event):
-		return context.window_manager.invoke_props_dialog(self)
+		_init_crs_dialog(self, [self.filepath], context.scene)
+		return context.window_manager.invoke_props_dialog(self, width=540)
 
 	def execute(self, context):
 
@@ -545,13 +817,21 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 			self.report({'ERROR'}, "Scene georef is broken, please fix it beforehand")
 			return {'CANCELLED'}
 
-		if geoscn.isGeoref:
+		if geoscn.hasCRS:
 			if self.reprojection:
 				shpCRS = self.shpCRS
 			else:
 				shpCRS = geoscn.crs
 		else:
 			shpCRS = self.shpCRS
+		target = ''
+		if self.assignIFC and self.georefIFC:
+			try:
+				target, sources = _ifc_crs_plan(self, [self.filepath], context.scene)
+				shpCRS = sources[self.filepath]
+			except (ValueError, OSError) as exc:
+				self.report({'ERROR'}, str(exc))
+				return {'CANCELLED'}
 
 		# Prepare IFC parameters
 		ifcClass = self.ifcClass if self.assignIFC else ""
@@ -559,20 +839,24 @@ class IMPORTGIS_OT_shapefile_props_dialog(Operator):
 		ifcUserDefinedType = self.ifcUserDefinedType if self.assignIFC else ""
 
 		# Prepare coloring parameters
-		colorField = self.fieldColorName if self.useRandomColor else ""
+		colorField = self.fieldColorName if self.separateObjects and self.useRandomColor else ""
 
 		log.info(f"IFC Assignment: assignIFC={self.assignIFC}, ifcClass={ifcClass}")
 		log.info(f"Random coloring: useRandomColor={self.useRandomColor}, colorField={colorField}")
 
 		try:
-			bpy.ops.importgis.shapefile('INVOKE_DEFAULT', filepath=self.filepath, shpCRS=shpCRS, elevSource=self.vertsElevSource,
+			result = bpy.ops.importgis.shapefile('INVOKE_DEFAULT', filepath=self.filepath, shpCRS=shpCRS,
+				targetCRS=target, placementMode=self.placementMode, elevSource=self.vertsElevSource,
+				manualElevation=self.manualElevation,
 				fieldElevName=elevField, objElevName=objElevName, fieldExtrudeName=extrudField, fieldObjName=nameField,
 				extrusionAxis=self.extrusionAxis, separateObjects=self.separateObjects,
-				ifcClass=ifcClass, ifcPredefinedType=ifcPredefinedType, ifcUserDefinedType=ifcUserDefinedType,
-				useRandomColor=self.useRandomColor, fieldColorName=colorField)
+				ifcClass=ifcClass, ifcPredefinedType=ifcPredefinedType, ifcUserDefinedType=ifcUserDefinedType, psetName=self.psetName,
+				useRandomColor=self.separateObjects and self.useRandomColor, fieldColorName=colorField)
 		except Exception as e:
 			log.error('Shapefile import fails', exc_info=True)
 			self.report({'ERROR'}, 'Shapefile import fails, check logs.')
+			return {'CANCELLED'}
+		if 'CANCELLED' in result:
 			return {'CANCELLED'}
 
 		return{'FINISHED'}
@@ -590,8 +874,13 @@ class IMPORTGIS_OT_shapefile(Operator):
 	filepath: StringProperty()
 
 	shpCRS: StringProperty(name = "Shapefile CRS", description = "Coordinate Reference System")
+	targetCRS: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+	placementMode: EnumProperty(items=_PLACEMENT_MODES, default='MAP', options={'HIDDEN', 'SKIP_SAVE'})
 
-	elevSource: StringProperty(name = "Elevation source", description = "Elevation source", default='GEOM') # [NONE, GEOM, OBJ, FIELD]
+	elevSource: StringProperty(name = "Elevation source", description = "Elevation source", default='GEOM')
+	manualElevation: FloatProperty(name='Base elevation', unit='LENGTH')
+	verticalGap: FloatProperty(name='Vertical gap', unit='LENGTH', min=0, default=0)
+	featureStart: IntProperty(default=0, min=0, options={'HIDDEN', 'SKIP_SAVE'})
 	objElevName: StringProperty(name = "Elevation object name", description = "")
 
 	fieldElevName: StringProperty(name = "Elevation field", description = "Field name")
@@ -602,6 +891,7 @@ class IMPORTGIS_OT_shapefile(Operator):
 	ifcClass: StringProperty(name = "IFC Class", description = "IFC class name for Bonsai/BlenderBIM", default="")
 	ifcPredefinedType: StringProperty(name = "IFC Predefined Type", description = "IFC predefined type", default="")
 	ifcUserDefinedType: StringProperty(name = "IFC User Defined Type", description = "IFC user defined type", default="")
+	psetName: StringProperty(name="Property set name", default="Pset_GIS_Attributes")
 
 	# Random coloring
 	useRandomColor: BoolProperty(name = "Random color by field", description = "Assign random colors based on field values", default=False)
@@ -631,6 +921,20 @@ class IMPORTGIS_OT_shapefile(Operator):
 	def execute(self, context):
 
 		prefs = bpy.context.preferences.addons[PKG].preferences
+		ifc_failures = 0
+		if self.ifcClass:
+			tool = _get_bonsai_tool()
+			model = tool.Ifc.get() if tool is not None else None
+			if model is None:
+				self.report({'WARNING'}, "No active Bonsai IFC project: only custom properties will be saved")
+			else:
+				try:
+					if _prepare_ifc_geometry(context, model):
+						self.report({'WARNING'}, "Bonsai geometry kernel unavailable; switched to OpenCASCADE")
+				except Exception:
+					log.error("Bonsai geometry kernel is unavailable", exc_info=True)
+					self.report({'ERROR'}, "Bonsai geometry kernel unavailable; check Bonsai installation and geometry settings")
+					return {'CANCELLED'}
 
 		log.info(f"IFC parameters received: ifcClass={self.ifcClass}, ifcPredefinedType={self.ifcPredefinedType}, ifcUserDefinedType={self.ifcUserDefinedType}")
 
@@ -673,7 +977,11 @@ class IMPORTGIS_OT_shapefile(Operator):
 		fieldsNames = [field[0] for field in fields]
 		log.debug("DBF fields : "+str(fieldsNames))
 
-		if self.separateObjects or self.fieldElevName or self.fieldObjName or self.fieldExtrudeName:
+		if self.useRandomColor and (not self.separateObjects or not self.fieldColorName):
+			self.report({'ERROR'}, "Random color requires separate objects and a color field")
+			return {'CANCELLED'}
+
+		if self.separateObjects or self.fieldElevName or self.fieldObjName or self.fieldExtrudeName or (self.useRandomColor and self.fieldColorName):
 			self.useDbf = True
 		else:
 			self.useDbf = False
@@ -713,6 +1021,7 @@ class IMPORTGIS_OT_shapefile(Operator):
 		# Color field lookup
 		colorFieldIdx = None
 		colorMap = {}
+		colorMaterials = {}
 		if self.useRandomColor and self.fieldColorName:
 			try:
 				colorFieldIdx = fieldsNames.index(self.fieldColorName)
@@ -731,7 +1040,26 @@ class IMPORTGIS_OT_shapefile(Operator):
 
 		scale = geoscn.scale #TODO
 
-		if not geoscn.hasCRS: #if not geoscn.isGeoref:
+		projected_points = None
+		if self.targetCRS:
+			try:
+				if shp.shapeType not in (1, 3, 5):
+					raise GeoreferenceError('Georeferenced import currently supports 2D points, lines and polygons')
+				bbox = BBOX(shp.bbox)
+				if shpCRS != self.targetCRS:
+					points = list(dict.fromkeys(tuple(pt[:2]) for shape in shp.iterShapes() for pt in shape.points))
+					if not points:
+						raise GeoreferenceError('Shapefile has no coordinates')
+					transformed = transform_coordinates(shpCRS, self.targetCRS, points)['points']
+					projected_points = dict(zip(points, transformed))
+					x, y = zip(*transformed)
+					bbox = BBOX(min(x), min(y), max(x), max(y))
+				dx, dy = _establish_ifc_origin(geoscn, self.targetCRS, bbox, self.placementMode)
+			except (ValueError, OSError, RuntimeError) as exc:
+				self.report({'ERROR'}, str(exc))
+				return {'CANCELLED'}
+
+		if not self.targetCRS and not geoscn.hasCRS:
 			try:
 				geoscn.crs = shpCRS
 			except Exception as e:
@@ -740,7 +1068,7 @@ class IMPORTGIS_OT_shapefile(Operator):
 				return {'CANCELLED'}
 
 		#Init reprojector class
-		if geoscn.crs != shpCRS:
+		if not self.targetCRS and geoscn.crs != shpCRS:
 			log.info("Data will be reprojected from {} to {}".format(shpCRS, geoscn.crs))
 			try:
 				rprj = Reproj(shpCRS, geoscn.crs)
@@ -754,16 +1082,15 @@ class IMPORTGIS_OT_shapefile(Operator):
 					return {'CANCELLED'}
 
 		#Get bbox
-		bbox = BBOX(shp.bbox)
-		if geoscn.crs != shpCRS:
-			bbox = rprj.bbox(bbox)
-
-		#Get or set georef dx, dy
-		if not geoscn.isGeoref:
-			dx, dy = bbox.center
-			geoscn.setOriginPrj(dx, dy)
-		else:
-			dx, dy = geoscn.getOriginPrj()
+		if not self.targetCRS:
+			bbox = BBOX(shp.bbox)
+			if geoscn.crs != shpCRS:
+				bbox = rprj.bbox(bbox)
+			if not geoscn.isGeoref:
+				dx, dy = bbox.center
+				geoscn.setOriginPrj(dx, dy)
+			else:
+				dx, dy = geoscn.getOriginPrj()
 
 		#Get reader iterator (using iterator avoids loading all data in memory)
 		#warn, shp with zero field will return an empty shapeRecords() iterator
@@ -830,7 +1157,9 @@ class IMPORTGIS_OT_shapefile(Operator):
 				continue #go to next iteration of the loop
 
 			#Reproj geom
-			if geoscn.crs != shpCRS:
+			if projected_points is not None:
+				pts = [projected_points[tuple(pt[:2])] for pt in pts]
+			elif not self.targetCRS and geoscn.crs != shpCRS:
 				pts = rprj.pts(pts)
 
 			#Get extrusion offset
@@ -869,13 +1198,16 @@ class IMPORTGIS_OT_shapefile(Operator):
 							log.warning('Cannot extract elevation value for feature {} : {}'.format(i, e))
 							z = 0 #null values will be set to zero
 
+					elif self.elevSource == 'MANUAL':
+						z = self.manualElevation
+
 					elif shpType[-1] == 'Z' and self.elevSource == 'GEOM':
 						z = shape.z[idx1:idx2][k]
 
 					else:
 						z = 0
 
-					geom.append((pt[0], pt[1], z))
+					geom.append((pt[0], pt[1], z + (self.featureStart + i) * self.verticalGap))
 
 				#Shift coords
 				geom = [(pt[0]-dx, pt[1]-dy, pt[2]) for pt in geom]
@@ -943,19 +1275,11 @@ class IMPORTGIS_OT_shapefile(Operator):
 
 			if self.separateObjects:
 
+				name = shpName
 				if self.fieldObjName:
-					try:
-						name = record[nameFieldIdx]
-					except Exception as e:
-						log.warning('Cannot extract name value for feature {} : {}'.format(i, e))
-						name = ''
-					# null values will return a bytes object containing a blank string of length equal to fields length definition
-					if isinstance(name, bytes):
-						name = ''
-					else:
-						name = str(name)
-				else:
-					name = shpName
+					value = record[nameFieldIdx]
+					if value is not None:
+						name = str(value).strip() or shpName
 
 				#Calc bmesh bbox
 				_bbox = getBBOX.fromBmesh(bm)
@@ -988,28 +1312,21 @@ class IMPORTGIS_OT_shapefile(Operator):
 				##bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY')
 
 				#write attributes data and build properties dict for IFC Psets
-				shapefile_props = {}
-				for i, field in enumerate(shp.fields):
-					fieldName, fieldType, fieldLength, fieldDecLength = field
-					if fieldName != 'DeletionFlag':
-						if fieldType in ('N', 'F'):
-							v = record[i-1]
-							if v is not None:
-								#cast to float to avoid overflow error when affecting custom property
-								obj[fieldName] = float(record[i-1])
-								shapefile_props[fieldName] = float(record[i-1])
-						else:
-							obj[fieldName] = record[i-1]
-							shapefile_props[fieldName] = record[i-1]
+				shapefile_props = dict(zip(fieldsNames, record))
+				for field, value in _prepare_pset_properties(shapefile_props).items():
+					if value is not None:
+						# Blender object properties have a narrower integer range than IFC.
+						obj[field] = float(value) if type(value) is int else value
 
 				# Assign IFC properties if enabled
 				if self.ifcClass:
-					assign_ifc_class_to_object(obj, self.ifcClass, self.ifcPredefinedType, self.ifcUserDefinedType, properties=shapefile_props)
+					if not assign_ifc_class_to_object(obj, self.ifcClass, self.ifcPredefinedType, self.ifcUserDefinedType, properties=shapefile_props, sync_placement=bool(self.targetCRS), pset_name=self.psetName):
+						ifc_failures += 1
+						break
 
-				# Apply random coloring if enabled
+				# Reuse a single material and IFC style for each distinct field value.
 				if self.useRandomColor and colorFieldIdx is not None:
 					try:
-						# Get the field value for this feature
 						field_value = record[colorFieldIdx]
 						if isinstance(field_value, bytes):
 							field_value = field_value.decode('utf-8', errors='replace').strip()
@@ -1017,30 +1334,25 @@ class IMPORTGIS_OT_shapefile(Operator):
 							field_value = ""
 						else:
 							field_value = str(field_value)
-
-						# Get or generate color for this field value
 						color = _get_color_for_field_value(field_value, colorMap)
-
-						# Apply Blender material (always, for visual feedback)
-						assign_blender_material(obj, color)
-
-						# If Bonsai is available and IFC class was assigned, also assign IfcSurfaceStyle
-						if BONSAI_AVAILABLE and self.ifcClass:
-							try:
-								model = tool.Ifc.get()
-								if model is not None:
-									# Find the IFC element linked to this object
-									for element in model:
-										if element.is_a() == self.ifcClass:
-											linked_obj = tool.Ifc.get_object(element)
-											if linked_obj and linked_obj.name == obj.name:
-												_assign_ifc_surface_style(model, element, color)
-												break
-							except Exception as e:
-								log.warning(f"Could not assign IfcSurfaceStyle for object '{obj.name}': {e}")
-
-					except Exception as e:
-						log.warning(f"Failed to apply coloring for feature {i}: {e}")
+						material = colorMaterials.get(field_value)
+						if material is None:
+							material = assign_blender_material(obj, color, self.fieldColorName, field_value)
+							colorMaterials[field_value] = material
+						elif obj.data.materials:
+							obj.data.materials[0] = material
+						else:
+							obj.data.materials.append(material)
+						tool = _get_bonsai_tool()
+						if tool is not None and self.ifcClass and tool.Ifc.get() is not None:
+							element = tool.Ifc.get_entity(obj)
+							if element is None:
+								raise RuntimeError("Imported object is not linked to an IFC element")
+							_assign_ifc_surface_style(tool.Ifc.get(), element, material, tool)
+					except Exception:
+						log.error("Failed to apply field color", exc_info=True)
+						ifc_failures += 1
+						break
 
 			elif self.fieldExtrudeName:
 				#Join to final bmesh (use from_mesh method hack)
@@ -1074,10 +1386,14 @@ class IMPORTGIS_OT_shapefile(Operator):
 
 			# Assign IFC properties if enabled (no individual shapefile record for merged object)
 			if self.ifcClass:
-				assign_ifc_class_to_object(obj, self.ifcClass, self.ifcPredefinedType, self.ifcUserDefinedType, properties={})
+				if not assign_ifc_class_to_object(obj, self.ifcClass, self.ifcPredefinedType, self.ifcUserDefinedType, sync_placement=bool(self.targetCRS)):
+					ifc_failures += 1
 
 		#free the bmesh
 		bm.free()
+		if ifc_failures:
+			self.report({'ERROR'}, "IFC assignment or coloring failed; model may be partially changed. Undo and check logs")
+			return {'CANCELLED'}
 
 		t = perf_clock() - t0
 		log.info('Build in %f seconds' % t)
@@ -1133,6 +1449,33 @@ class IMPORTGIS_OT_shapefile_batch_file_dialog(Operator):
 		return{'FINISHED'}
 
 
+def _batch_common_fields(filepaths, numeric=False):
+	"""Fields shared by all files; numeric choices must be numeric in every file."""
+	common = None
+	for path in filepaths:
+		with shpReader(path) as shp:
+			fields = {field[0] for field in shp.fields if field[0] != 'DeletionFlag'
+				and (not numeric or field[1] in ('N', 'F', 'L'))}
+		common = fields if common is None else common & fields
+	return sorted(common or ())
+
+
+# Blender keeps references to enum strings returned by callbacks.
+_batch_field_items = {}
+
+
+def _batch_field_choices(numeric=False):
+	try:
+		fields = _batch_common_fields(_batch_files, numeric=numeric)
+	except Exception as exc:
+		log.warning('Unable to read batch fields: %s', exc)
+		fields = []
+	key = (tuple(_batch_files), numeric, tuple(fields))
+	if key not in _batch_field_items:
+		_batch_field_items[key] = [(name, name, 'Field shared by all selected files') for name in fields]
+	return _batch_field_items[key]
+
+
 class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 	"""Batch shapefile importer properties dialog"""
 
@@ -1140,10 +1483,25 @@ class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 	bl_description = 'Batch import ESRI shapefiles (.shp)'
 	bl_label = "Batch Import SHP"
 	bl_options = {"INTERNAL"}
+	crsPreview: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+	crsMatches: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+	projectCRS: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+	suggestedCRS: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+	georefIFC: BoolProperty(default=True, options={'HIDDEN'})
+	placementMode: EnumProperty(name='IFC placement', items=_PLACEMENT_MODES, default='MAP', options={'SKIP_SAVE'})
+	overrideTarget: BoolProperty(name='Choose a different target CRS', options={'SKIP_SAVE'})
+	targetCRS: StringProperty(name='IFC target CRS', options={'SKIP_SAVE'})
+	confirmCRS: BoolProperty(name='I verified the source CRS in QGIS', options={'SKIP_SAVE'})
 
 	#special function to auto redraw an operator popup called through invoke_props_dialog
 	def check(self, context):
 		return True
+
+	def listFields(self, context):
+		return _batch_field_choices()
+
+	def listNumericFields(self, context):
+		return _batch_field_choices(numeric=True)
 
 	def listPredefCRS(self, context):
 		return PredefCRS.getEnumItems()
@@ -1171,14 +1529,31 @@ class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 			items=[
 			('NONE', 'None', "Flat geometry"),
 			('GEOM', 'Geometry', "Use z value from shape geometry if exists"),
-			('OBJ', 'Object', "Get z elevation value from an existing ground mesh")
+			('FIELD', 'Field', "Extract z elevation value from an attribute field"),
+			('OBJ', 'Object', "Get z elevation value from an existing ground mesh"),
+			('MANUAL', 'Manual', "Enter one base elevation for all imported features"),
 			],
 			default='GEOM')
+	manualElevation: FloatProperty(name='Base elevation', unit='LENGTH',
+		description='Set the same base Z for all imported features, before any extrusion')
+	useVerticalGap: BoolProperty(name='Vertical gap per feature', default=False,
+		description='Stack successive features at increasing elevations')
+	verticalGap: FloatProperty(name='Gap', unit='LENGTH', min=0, default=0,
+		description='Raise each successive feature by this additional amount; changes exported geometry elevations')
 
 	objElevLst: EnumProperty(
 		name="Elev. object",
 		description="Choose the mesh from which extract z elevation",
 		items=listObjects )
+
+	fieldElevName: EnumProperty(name="Elevation field", description="Numeric field shared by all selected files", items=listNumericFields)
+	useFieldExtrude: BoolProperty(name="Extrusion from field", description="Extrude using a numeric field shared by all selected files", default=False)
+	fieldExtrudeName: EnumProperty(name="Extrusion field", description="Numeric field shared by all selected files", items=listNumericFields)
+	extrusionAxis: EnumProperty(name="Extrude along", items=[('Z', 'Z axis', 'Extrude along Z axis'), ('NORMAL', 'Normal', 'Extrude along face normal')], default='Z')
+	useFieldName: BoolProperty(name="Object name from field", description="Use a field shared by all selected files", default=False)
+	fieldObjName: EnumProperty(name="Name field", description="Field shared by all selected files", items=listFields)
+	useRandomColor: BoolProperty(name="Random color by field", description="Assign random colors based on field values", default=False)
+	fieldColorName: EnumProperty(name="Color field", description="Field shared by all selected files", items=listFields)
 
 	separateObjects: BoolProperty(
 			name="Separate objects",
@@ -1186,9 +1561,9 @@ class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 			default=False )
 
 	assignIFC: BoolProperty(
-			name="Assign IFC Class",
+			name="Create IFC elements",
 			description="Assign IFC class to imported objects for Bonsai/BlenderBIM",
-			default=False )
+			default=True )
 
 	ifcClass: StringProperty(
 			name="IFC Class",
@@ -1205,6 +1580,11 @@ class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 			description="IFC user defined type (optional)",
 			default="" )
 
+	psetName: StringProperty(
+			name="Property set name",
+			description="IFC property set for shapefile attributes (blank uses the default)",
+			default="Pset_GIS_Attributes" )
+
 	def draw(self, context):
 		scn = context.scene
 		layout = self.layout
@@ -1212,8 +1592,33 @@ class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 		layout.prop(self, 'vertsElevSource')
 		if self.vertsElevSource == 'OBJ':
 			layout.prop(self, 'objElevLst')
-
+		elif self.vertsElevSource == 'FIELD':
+			layout.prop(self, 'fieldElevName')
+		elif self.vertsElevSource == 'MANUAL':
+			layout.prop(self, 'manualElevation')
+		row = layout.row()
+		extrude_column = row.column()
+		gap_column = row.column()
+		extrude_column.prop(self, 'useFieldExtrude')
+		if self.useFieldExtrude:
+			extrude_column.prop(self, 'fieldExtrudeName')
+			extrude_column.prop(self, 'extrusionAxis')
+		gap_column.prop(self, 'useVerticalGap')
+		if self.useVerticalGap:
+			gap_column.prop(self, 'verticalGap')
+			layout.label(text='Successive features stack; IFC elevations change.', icon='INFO')
 		layout.prop(self, 'separateObjects')
+		if self.separateObjects:
+			layout.prop(self, 'useFieldName')
+			if self.useFieldName:
+				layout.prop(self, 'fieldObjName')
+		if self.separateObjects:
+			layout.prop(self, 'useRandomColor')
+			if self.useRandomColor:
+				layout.prop(self, 'fieldColorName')
+		if len(_batch_files) > 1:
+			layout.label(text='Field choices are shared by all selected files.', icon='INFO')
+		layout.label(text='Elevation and extrusion use scene units; no vertical CRS conversion.', icon='INFO')
 
 		layout.separator()
 		layout.prop(self, 'assignIFC')
@@ -1221,15 +1626,21 @@ class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 			layout.prop(self, 'ifcClass')
 			layout.prop(self, 'ifcPredefinedType')
 			layout.prop(self, 'ifcUserDefinedType')
+			if self.separateObjects:
+				layout.prop(self, 'psetName')
 
 		geoscn = GeoScene()
+		_draw_crs_preview(layout, self.crsPreview)
+		_draw_ifc_crs(self)
+		if self.assignIFC and self.georefIFC:
+			return
 		if geoscn.isPartiallyGeoref:
 			layout.prop(self, 'reprojection')
 			if self.reprojection:
 				self.shpCRSInputLayout(context)
-			georefManagerLayout(self, context)
 		else:
 			self.shpCRSInputLayout(context)
+		georefManagerLayout(self, context)
 
 	def shpCRSInputLayout(self, context):
 		layout = self.layout
@@ -1240,10 +1651,27 @@ class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 		row.operator("bgis.add_predef_crs", text='', icon='ADD')
 
 	def invoke(self, context, event):
-		return context.window_manager.invoke_props_dialog(self)
+		_init_crs_dialog(self, _batch_files, context.scene)
+		return context.window_manager.invoke_props_dialog(self, width=540)
 
 	def execute(self, context):
 		global _batch_files
+
+		try:
+			common = set(_batch_common_fields(_batch_files))
+			numeric = set(_batch_common_fields(_batch_files, numeric=True))
+			for enabled, value, choices, label in (
+				(self.vertsElevSource == 'FIELD', self.fieldElevName, numeric, 'elevation'),
+				(self.useFieldExtrude, self.fieldExtrudeName, numeric, 'extrusion'),
+				(self.separateObjects and self.useFieldName, self.fieldObjName, common, 'name'),
+				(self.separateObjects and self.useRandomColor, self.fieldColorName, common, 'color'),
+			):
+				if enabled and value not in choices:
+					self.report({'ERROR'}, 'Choose a valid %s field shared by every selected shapefile' % label)
+					return {'CANCELLED'}
+		except Exception as exc:
+			self.report({'ERROR'}, 'Cannot inspect shapefile fields: %s' % exc)
+			return {'CANCELLED'}
 
 		if self.vertsElevSource == 'OBJ':
 			if not self.objElevLst:
@@ -1259,13 +1687,21 @@ class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 			self.report({'ERROR'}, "Scene georef is broken, please fix it beforehand")
 			return {'CANCELLED'}
 
-		if geoscn.isGeoref:
+		if geoscn.hasCRS:
 			if self.reprojection:
 				shpCRS = self.shpCRS
 			else:
 				shpCRS = geoscn.crs
 		else:
 			shpCRS = self.shpCRS
+		target = ''
+		sources = {}
+		if self.assignIFC and self.georefIFC:
+			try:
+				target, sources = _ifc_crs_plan(self, _batch_files, context.scene)
+			except (ValueError, OSError) as exc:
+				self.report({'ERROR'}, str(exc))
+				return {'CANCELLED'}
 
 		ifcClass = self.ifcClass if self.assignIFC else ""
 		ifcPredefinedType = self.ifcPredefinedType if self.assignIFC else ""
@@ -1273,30 +1709,51 @@ class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 
 		errors = []
 		imported = 0
+		feature_start = 0
+		vertical_gap = self.verticalGap if self.useVerticalGap else 0
 		for filepath in _batch_files:
 			try:
-				bpy.ops.importgis.shapefile(
+				if vertical_gap:
+					with shpReader(filepath) as reader:
+						feature_count = reader.numRecords
+				result = bpy.ops.importgis.shapefile(
 					filepath=filepath,
-					shpCRS=shpCRS,
+					shpCRS=sources.get(filepath, shpCRS),
+					targetCRS=target,
+					placementMode=self.placementMode,
 					elevSource=self.vertsElevSource,
-					fieldElevName='',
+					manualElevation=self.manualElevation,
+					verticalGap=vertical_gap,
+					featureStart=feature_start,
+					fieldElevName=self.fieldElevName if self.vertsElevSource == 'FIELD' else '',
 					objElevName=objElevName,
-					fieldExtrudeName='',
-					fieldObjName='',
-					extrusionAxis='Z',
+					fieldExtrudeName=self.fieldExtrudeName if self.useFieldExtrude else '',
+					fieldObjName=self.fieldObjName if self.separateObjects and self.useFieldName else '',
+					extrusionAxis=self.extrusionAxis,
 					separateObjects=self.separateObjects,
 					ifcClass=ifcClass,
 					ifcPredefinedType=ifcPredefinedType,
-					ifcUserDefinedType=ifcUserDefinedType)
-				imported += 1
+					ifcUserDefinedType=ifcUserDefinedType,
+					psetName=self.psetName,
+					useRandomColor=self.separateObjects and self.useRandomColor,
+					fieldColorName=self.fieldColorName if self.separateObjects and self.useRandomColor else '')
+				if 'FINISHED' in result:
+					imported += 1
+					if vertical_gap:
+						feature_start += feature_count
+				else:
+					errors.append(os.path.basename(filepath))
+					break
 			except Exception as e:
 				log.error('Batch shapefile import fails for %s', filepath, exc_info=True)
 				errors.append(os.path.basename(filepath))
+				break
 
 		_batch_files = []
 
 		if errors:
-			self.report({'WARNING'}, "Imported %i file(s), %i failed: %s" % (imported, len(errors), ', '.join(errors)))
+			self.report({'ERROR'}, "Imported %i file(s); stopped on %s. Check logs and undo if IFC changed" % (imported, ', '.join(errors)))
+			return {'CANCELLED'}
 		else:
 			self.report({'INFO'}, "Successfully imported %i shapefile(s)" % imported)
 
@@ -1304,6 +1761,7 @@ class IMPORTGIS_OT_shapefile_batch_props_dialog(Operator):
 
 
 classes = [
+	IMPORTGIS_OT_ifc_map_conversion,
 	IMPORTGIS_OT_shapefile_file_dialog,
 	IMPORTGIS_OT_shapefile_props_dialog,
 	IMPORTGIS_OT_shapefile,
@@ -1319,7 +1777,12 @@ def register():
 			log.warning('{} is already registered, now unregister and retry... '.format(cls))
 			bpy.utils.unregister_class(cls)
 			bpy.utils.register_class(cls)
+	if bonsai_pset_display.install() is not None:
+		bpy.app.timers.register(bonsai_pset_display.install, persistent=True)
 
 def unregister():
+	if bpy.app.timers.is_registered(bonsai_pset_display.install):
+		bpy.app.timers.unregister(bonsai_pset_display.install)
+	bonsai_pset_display.uninstall()
 	for cls in classes:
 		bpy.utils.unregister_class(cls)

@@ -20,14 +20,14 @@
 import bpy
 
 bl_info = {
-	'name': 'BlenderGIS-IFC',
-	'description': 'Various tools for handle geodata',
+	'name': 'GIS2BIM',
+	'description': 'Import GIS data and create IFC elements for BIM workflows',
 	'author': 'domlysz',
 	'license': 'GPL',
 	'deps': '',
 	'version': (2, 2, 14),
 	'blender': (2, 83, 0),
-	'location': 'View3D > Tools > GIS',
+	'location': 'View3D > GIS2BIM',
 	'warning': '',
 	'wiki_url': 'https://github.com/domlysz/BlenderGIS/wiki',
 	'tracker_url': 'https://github.com/domlysz/BlenderGIS/issues',
@@ -61,7 +61,7 @@ BASEMAPS = True
 DROP = True
 EARTH_SPHERE = True
 
-import os, sys, tempfile
+import os, tempfile
 from datetime import datetime
 
 def getAppData():
@@ -93,45 +93,6 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logHandler)
 logger.setLevel(logging.DEBUG)
 logger.info('###### Starting new Blender session : {}'.format(datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-
-def _excepthook(exc_type, exc_value, exc_traceback):
-	if 'BlenderGIS' in exc_traceback.tb_frame.f_code.co_filename:
-		logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
-	sys.__excepthook__(exc_type, exc_value, exc_traceback)
-
-sys.excepthook = _excepthook #warn, this is a global variable, can be overrided by another addon
-
-####
-'''
-Workaround for `sys.excepthook` thread
-https://stackoverflow.com/questions/1643327/sys-excepthook-and-threading
-'''
-import threading
-
-init_original = threading.Thread.__init__
-
-def init(self, *args, **kwargs):
-
-	init_original(self, *args, **kwargs)
-	run_original = self.run
-
-	def run_with_except_hook(*args2, **kwargs2):
-		try:
-			run_original(*args2, **kwargs2)
-		except Exception:
-			sys.excepthook(*sys.exc_info())
-
-	self.run = run_with_except_hook
-
-threading.Thread.__init__ = init
-
-####
-
-
-import ssl
-if (not os.environ.get('PYTHONHTTPSVERIFY', '') and
-	getattr(ssl, '_create_unverified_context', None)):
-	ssl._create_default_https_context = ssl._create_unverified_context
 
 #from .core.checkdeps import HAS_GDAL, HAS_PYPROJ, HAS_PIL, HAS_IMGIO
 from .core.settings import settings
@@ -176,7 +137,7 @@ icons_dict = {}
 
 class BGIS_OT_logs(bpy.types.Operator):
 	bl_idname = "bgis.logs"
-	bl_description = 'Display BlenderGIS logs'
+	bl_description = 'Display GIS2BIM logs'
 	bl_label = "Logs"
 
 	def execute(self, context):
@@ -196,8 +157,7 @@ class VIEW3D_MT_menu_gis_import(bpy.types.Menu):
 	bl_label = "Import"
 	def draw(self, context):
 		if IMPORT_SHP:
-			self.layout.operator("importgis.shapefile_file_dialog", icon_value=icons_dict["shp"].icon_id, text='Shapefile (.shp)')
-			self.layout.operator("importgis.shapefile_batch_file_dialog", icon_value=icons_dict["shp"].icon_id, text='Shapefile Batch (.shp)')
+			self.layout.operator("importgis.shapefile_batch_file_dialog", icon_value=icons_dict["shp"].icon_id, text='Shapefile(s) (.shp)')
 		if IMPORT_GEORASTER:
 			self.layout.operator("importgis.georaster", icon_value=icons_dict["raster"].icon_id, text="Georeferenced raster (.tif .jpg .jp2 .png)")
 		if IMPORT_OSM:
@@ -254,7 +214,7 @@ class VIEW3D_MT_menu_gis_nodes(bpy.types.Menu):
 			self.layout.operator("analysis.nodes", icon_value=icons_dict["terrain"].icon_id, text='Terrain analysis')
 
 class VIEW3D_MT_menu_gis(bpy.types.Menu):
-	bl_label = "GIS-IFC"
+	bl_label = "GIS2BIM"
 	# Set the menu operators and draw functions
 	def draw(self, context):
 		layout = self.layout
@@ -263,10 +223,6 @@ class VIEW3D_MT_menu_gis(bpy.types.Menu):
 		layout.menu('VIEW3D_MT_menu_gis_webgeodata', icon="URL")
 		layout.menu('VIEW3D_MT_menu_gis_import', icon='IMPORT')
 		layout.menu('VIEW3D_MT_menu_gis_export', icon='EXPORT')
-		layout.menu('VIEW3D_MT_menu_gis_camera', icon='CAMERA_DATA')
-		layout.menu('VIEW3D_MT_menu_gis_mesh', icon='MESH_DATA')
-		layout.menu('VIEW3D_MT_menu_gis_object', icon='CUBE')
-		layout.menu('VIEW3D_MT_menu_gis_nodes', icon='NODETREE')
 		layout.separator()
 		layout.operator("bgis.logs", icon='TEXT')
 
